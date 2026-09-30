@@ -32,6 +32,7 @@ import argparse
 import numpy as np
 import pandas as pd
 import rasterio
+from rasterio.warp import transform as warp_transform
 import faiss
 from PIL import Image, ImageDraw
 from scipy import ndimage as ndi
@@ -205,11 +206,21 @@ def compute_confidence(dist: float, change_type: str,
     return round(min(0.95, composite), 3)
 
 
+def pixel_size_m(src, latitude: float) -> tuple[float, float]:
+    if src.crs and src.crs.is_projected:
+        return abs(src.res[0]), abs(src.res[1])
+    return (
+        abs(src.res[0]) * 111_320 * np.cos(np.radians(latitude)),
+        abs(src.res[1]) * 111_320,
+    )
+
+
 def detect_change_objects(before_path: str, after_path: str):
     """
     Computes spectral delta and isolates discrete changed objects/clusters.
     Returns:
-      boxes: list of (x1, y1, x2, y2) in 512x512 tile coordinates
+    boxes: list of (x1, y1, x2, y2) in tile coordinates
+    objects: measured connected change regions with area and confidence
       diff_heatmap: PIL.Image showing high-contrast change heat overlay
     """
     try:
@@ -217,10 +228,14 @@ def detect_change_objects(before_path: str, after_path: str):
             b_data = s1.read().astype(np.float32)
             a_data = s2.read().astype(np.float32)
             nodata = s1.nodata or 0
+            transform = s2.transform
+            crs = s2.crs
+            center_latitude = (s2.bounds.bottom + s2.bounds.top) / 2
+            pixel_x_m, pixel_y_m = pixel_size_m(s2, center_latitude)
 
         valid = (b_data[0] > nodata) & (a_data[0] > nodata) & (b_data[0] > 0) & (a_data[0] > 0)
         if valid.sum() < 500:
-            return [], None
+            return [], None, []
 
         # Red delta + NIR delta + broadband delta
         d_red = np.abs(a_data[2] - b_data[2])
@@ -242,14 +257,52 @@ def detect_change_objects(before_path: str, after_path: str):
         slices = ndi.find_objects(labeled)
 
         boxes = []
-        for sl in slices:
+        objects = []
+        pixel_area_m2 = pixel_x_m * pixel_y_m
+        water_ndwi = (a_data[1] - a_data[3]) / (a_data[1] + a_data[3] + 1e-6)
+        water_mask = (water_ndwi > 0.12) & valid
+        water_distances = (
+            ndi.distance_transform_edt(~water_mask, sampling=(pixel_y_m, pixel_x_m))
+            if water_mask.any() else None
+        )
+        for label_id, sl in enumerate(slices, 1):
             if sl is None:
                 continue
             y_sl, x_sl = sl
             h = y_sl.stop - y_sl.start
             w = x_sl.stop - x_sl.start
             if w >= 12 and h >= 12 and (w * h) >= 180:
-                boxes.append((x_sl.start, y_sl.start, x_sl.stop, y_sl.stop))
+                box = (x_sl.start, y_sl.start, x_sl.stop, y_sl.stop)
+                boxes.append(box)
+                component = labeled[sl] == label_id
+                pixel_count = int(component.sum())
+                center_y, center_x = ndi.center_of_mass(component)
+                center_y += y_sl.start
+                center_x += x_sl.start
+                center_row, center_col = int(round(center_y)), int(round(center_x))
+                x_coord = transform.c + (center_col + 0.5) * transform.a
+                y_coord = transform.f + (center_row + 0.5) * transform.e
+                if crs and crs.is_projected:
+                    lon, lat = warp_transform(crs, "EPSG:4326", [x_coord], [y_coord])
+                    lon, lat = lon[0], lat[0]
+                else:
+                    lon, lat = x_coord, y_coord
+                local_strength = float(delta_metric[sl][component].mean())
+                objects.append({
+                    "object_id": len(objects) + 1,
+                    "bbox_pixels": list(box),
+                    "centroid_pixel": [round(center_x, 1), round(center_y, 1)],
+                    "centroid_lon": round(float(lon), 6),
+                    "centroid_lat": round(float(lat), 6),
+                    "area_pixels": pixel_count,
+                    "area_m2": round(pixel_count * pixel_area_m2, 1),
+                    "confidence": round(min(0.99, local_strength / (thresh * 2 + 1e-6)), 3),
+                    "mean_change_strength": round(local_strength, 2),
+                    "distance_to_water_m": (
+                        round(float(water_distances[center_row, center_col]), 1)
+                        if water_distances is not None else None
+                    ),
+                })
 
         # Build high-visibility heatmap overlay image (Black -> Red -> Yellow -> White)
         norm_diff = np.clip((delta_metric / (thresh * 1.6 + 1e-6)) * 255.0, 0, 255).astype(np.uint8)
@@ -258,9 +311,71 @@ def detect_change_objects(before_path: str, after_path: str):
         h_b = np.zeros_like(norm_diff)
         heatmap_img = Image.fromarray(np.stack([h_r, h_g, h_b], axis=-1))
 
-        return boxes, heatmap_img
+        return boxes, heatmap_img, objects
     except Exception as e:
-        return [], None
+        return [], None, []
+
+
+def temporal_change_timeline(location_tiles: list[str], baseline_index: int,
+                             threshold: float) -> tuple[list[dict], str, str]:
+    baseline_file = location_tiles[baseline_index]
+    baseline_date = tile_to_meta[baseline_file]["acquisition_date"]
+    timeline = [{
+        "date": baseline_date,
+        "tile_file": baseline_file,
+        "status": "baseline",
+        "distance_from_baseline": 0.0,
+    }]
+    first_appeared = None
+    persisted_through = None
+    persistence_active = True
+
+    for tile_file in location_tiles[baseline_index + 1:]:
+        if tile_file not in tile_to_vec:
+            continue
+        distance = cosine_distance(tile_to_vec[baseline_file], tile_to_vec[tile_file])
+        changed = distance >= threshold
+        date = tile_to_meta[tile_file]["acquisition_date"]
+        status = "change_persisted" if changed else "change_not_detected"
+        timeline.append({
+            "date": date,
+            "tile_file": tile_file,
+            "status": status,
+            "distance_from_baseline": round(distance, 4),
+        })
+        if changed:
+            first_appeared = first_appeared or date
+            if persistence_active:
+                persisted_through = date
+        elif first_appeared is not None:
+            persistence_active = False
+
+    return timeline, first_appeared or tile_to_meta[location_tiles[baseline_index + 1]]["acquisition_date"], persisted_through or tile_to_meta[location_tiles[baseline_index + 1]]["acquisition_date"]
+
+
+def false_alarm_evidence(before_path: str, after_path: str) -> dict:
+    """Measure radiometric cues that may indicate shadow or vegetation variation."""
+    try:
+        with rasterio.open(before_path) as before_src, rasterio.open(after_path) as after_src:
+            before = before_src.read().astype(np.float32)
+            after = after_src.read().astype(np.float32)
+        valid = (before[0] > 0) & (after[0] > 0)
+        if valid.sum() < 500:
+            return {"shadow_fraction": 0.0, "vegetation_index_delta": 0.0}
+
+        before_brightness = before[:3].mean(axis=0)
+        after_brightness = after[:3].mean(axis=0)
+        dark_threshold = np.percentile(before_brightness[valid], 20) * 0.65
+        shadow_fraction = float(((after_brightness < dark_threshold) & valid).sum() / valid.sum())
+        before_ndvi = (before[3] - before[2]) / (before[3] + before[2] + 1e-6)
+        after_ndvi = (after[3] - after[2]) / (after[3] + after[2] + 1e-6)
+        vegetation_delta = float(np.mean(after_ndvi[valid]) - np.mean(before_ndvi[valid]))
+        return {
+            "shadow_fraction": round(shadow_fraction, 4),
+            "vegetation_index_delta": round(vegetation_delta, 4),
+        }
+    except Exception:
+        return {"shadow_fraction": 0.0, "vegetation_index_delta": 0.0}
 
 
 def save_before_after(before_path, after_path, before_date, after_date,
@@ -269,10 +384,10 @@ def save_before_after(before_path, after_path, before_date, after_date,
         b_img = tile_to_rgb(before_path).resize((THUMB_SIZE, THUMB_SIZE))
         a_img = tile_to_rgb(after_path).resize((THUMB_SIZE, THUMB_SIZE))
     except Exception:
-        return 0
+        return 0, []
 
     # Detect discrete changed objects & bounding boxes
-    boxes, heatmap_img = detect_change_objects(before_path, after_path)
+    boxes, heatmap_img, objects = detect_change_objects(before_path, after_path)
     if heatmap_img is not None:
         heat_thumb = heatmap_img.resize((THUMB_SIZE, THUMB_SIZE))
     else:
@@ -327,7 +442,7 @@ def save_before_after(before_path, after_path, before_date, after_date,
               fill=(190, 190, 255))
 
     canvas.save(out_path)
-    return len(boxes)
+    return len(boxes), objects
 
 
 # ─── MAIN DETECTION LOOP ──────────────────────────────────────────────────────
@@ -415,6 +530,9 @@ def detect_changes(threshold: float, date_from: str = None, date_to: str = None)
                 # PS 2.2.2: Earliest observation estimate
                 earliest = estimate_earliest_observation(
                     season_tiles_sorted[:i + 2], threshold)
+                timeline, first_appeared, persisted_through = temporal_change_timeline(
+                    season_tiles_sorted, i, threshold)
+                pair_evidence = false_alarm_evidence(before_path, after_path)
 
                 # Before/after preview (PS 2.2.5)
                 preview_name = (
@@ -423,7 +541,7 @@ def detect_changes(threshold: float, date_from: str = None, date_to: str = None)
                     f"{after_meta['acquisition_date']}.png"
                 )
                 preview_path = os.path.join(PREVIEW_DIR, preview_name)
-                num_objects = save_before_after(
+                num_objects, objects = save_before_after(
                     before_path, after_path,
                     before_meta["acquisition_date"],
                     after_meta["acquisition_date"],
@@ -448,6 +566,12 @@ def detect_changes(threshold: float, date_from: str = None, date_to: str = None)
                     "change_type":         change_type,
                     "confidence":          float(confidence),
                     "num_objects_marked":  int(num_objects),
+                    "area_m2":             round(sum(obj["area_m2"] for obj in objects), 1),
+                    "objects":              objects,
+                    "first_appeared":       first_appeared,
+                    "persisted_through":    persisted_through,
+                    "temporal_timeline":    timeline,
+                    "false_alarm_evidence": pair_evidence,
                     "preview_file":        preview_name,
                     "sensor":              before_meta["sensor"],
                     "analyst_decision":    "",   # PS 2.2.5 audit trail
@@ -462,7 +586,9 @@ def detect_changes(threshold: float, date_from: str = None, date_to: str = None)
         "earliest_observation",
         "lon_min", "lat_min", "lon_max", "lat_max",
         "embedding_distance", "change_type", "confidence",
-        "num_objects_marked", "preview_file", "sensor",
+        "num_objects_marked", "area_m2", "first_appeared", "persisted_through",
+        "objects_json", "temporal_timeline_json", "false_alarm_evidence_json",
+        "preview_file", "sensor",
         "analyst_decision", "analyst_notes",   # PS 2.2.5 audit columns
     ]
 
@@ -470,7 +596,14 @@ def detect_changes(threshold: float, date_from: str = None, date_to: str = None)
     with open(REPORT_FILE, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
-        writer.writerows(records_sorted)
+        csv_records = []
+        for record in records_sorted:
+            csv_record = dict(record)
+            csv_record["objects_json"] = json.dumps(record["objects"])
+            csv_record["temporal_timeline_json"] = json.dumps(record["temporal_timeline"])
+            csv_record["false_alarm_evidence_json"] = json.dumps(record["false_alarm_evidence"])
+            csv_records.append(csv_record)
+        writer.writerows(csv_records)
 
     # Save JSON candidates for Phase 6 suppression pipeline
     candidates_json = os.path.join(INDEX_DIR, "change_candidates.json")

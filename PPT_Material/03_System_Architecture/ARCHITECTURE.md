@@ -64,3 +64,10 @@
   │ Eval Report  │   Mean query latency: 88ms | Coverage: 868 km²
   └──────────────┘
 ```
+
+## Offline Evidence Extensions
+
+- Search parses object terms, explicit years/dates, the Ranchi AOI or coordinates, and river/water proximity locally; CLIP still ranks the original query text.
+- Change candidates include connected-region area, centroid, local confidence, water distance, and a baseline-relative observation timeline.
+- Suppression retains the audit trail and records cloud/no-data, possible shadow, vegetation/seasonal variation, and temporary-water cues with their penalties.
+- The review map is a coordinate plot rather than a basemap, so it does not request external map tiles.

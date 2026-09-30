@@ -27,6 +27,11 @@ import open_clip
 import faiss
 import rasterio
 from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage as ndi
+try:
+    from .query_understanding import parse_query
+except ImportError:
+    from query_understanding import parse_query
 
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 SIH_DIR      = os.path.dirname(SCRIPT_DIR) if os.path.basename(SCRIPT_DIR).upper() == "CODE" else SCRIPT_DIR
@@ -116,6 +121,31 @@ def apply_filters(results, date_from=None, date_to=None,
     return filtered
 
 
+def tile_has_water_near_center(tile_path: str, radius_m: float) -> bool:
+    """Use a local NDWI mask to enforce tile-center proximity to surface water."""
+    try:
+        with rasterio.open(tile_path) as src:
+            green = src.read(2).astype(np.float32)
+            nir = src.read(4).astype(np.float32)
+            water = ((green - nir) / (green + nir + 1e-6) > 0.12) & (green > 0)
+            if not water.any():
+                return False
+
+            if src.crs and src.crs.is_projected:
+                pixel_x, pixel_y = abs(src.res[0]), abs(src.res[1])
+            else:
+                center_lat = (src.bounds.bottom + src.bounds.top) / 2
+                pixel_y = abs(src.res[1]) * 111_320
+                pixel_x = abs(src.res[0]) * 111_320 * np.cos(np.radians(center_lat))
+            distances = ndi.distance_transform_edt(
+                ~water, sampling=(pixel_y, pixel_x)
+            )
+            center = (src.height // 2, src.width // 2)
+            return bool(distances[center] <= radius_m)
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def search(query_vector: np.ndarray, top_k: int = 10):
     """Search FAISS index and return (score, metadata) pairs."""
     scores, indices = index.search(query_vector, top_k)
@@ -173,6 +203,7 @@ def main():
         print(f'Text query : "{args.query}"')
         query_vec   = embed_text(args.query)
         query_label = args.query
+        query_constraints = parse_query(args.query)
     else:
         image_path = args.image
         if not os.path.exists(image_path):
@@ -185,6 +216,7 @@ def main():
         print(f"Image query: {image_path}")
         query_vec   = embed_image_tile(image_path)
         query_label = os.path.basename(image_path)
+        query_constraints = {}
 
     # Search (fetch larger pool before filtering so filters don't exhaust results)
     pool_size = min(args.top * 10, index.ntotal)
@@ -193,10 +225,20 @@ def main():
     # Apply metadata filters
     filtered = apply_filters(
         raw_results,
-        date_from=args.date_from, date_to=args.date_to,
-        lon_min=args.lon_min,     lat_min=args.lat_min,
-        lon_max=args.lon_max,     lat_max=args.lat_max,
+        date_from=args.date_from or query_constraints.get("date_from"),
+        date_to=args.date_to or query_constraints.get("date_to"),
+        lon_min=args.lon_min if args.lon_min is not None else (query_constraints.get("location_bounds") or {}).get("lon_min"),
+        lat_min=args.lat_min if args.lat_min is not None else (query_constraints.get("location_bounds") or {}).get("lat_min"),
+        lon_max=args.lon_max if args.lon_max is not None else (query_constraints.get("location_bounds") or {}).get("lon_max"),
+        lat_max=args.lat_max if args.lat_max is not None else (query_constraints.get("location_bounds") or {}).get("lat_max"),
     )
+    if query_constraints.get("near_feature") == "water":
+        filtered = [
+            (score, meta) for score, meta in filtered
+            if tile_has_water_near_center(
+                os.path.join(TILES_DIR, meta["tile_file"]), query_constraints["radius_m"]
+            )
+        ]
     top_results = filtered[: args.top]
 
     # Print results
@@ -212,35 +254,39 @@ def main():
         print(f"       Sensor: {meta['sensor']}")
     print(f"\n{'='*55}")
 
-    # Save visual preview & single clean search_results.csv
+    # Save a preview when available and always replace the result CSV.
+    csv_file = os.path.join(RESULTS_DIR, "search_results.csv")
+    csv_fieldnames = ["rank", "query", "object", "location", "near_feature", "radius_m",
+                      "score", "tile_file", "acquisition_date", "lat_min", "lat_max",
+                      "lon_min", "lon_max", "sensor"]
+    rows = []
+    for rank, (score, meta) in enumerate(top_results, 1):
+        rows.append({
+            "rank": rank,
+            "query": query_label,
+            "object": query_constraints.get("object", ""),
+            "location": query_constraints.get("location", ""),
+            "near_feature": query_constraints.get("near_feature", ""),
+            "radius_m": query_constraints.get("radius_m", ""),
+            "score": round(score, 4),
+            "tile_file": meta["tile_file"],
+            "acquisition_date": meta["acquisition_date"],
+            "lat_min": meta["lat_min"],
+            "lat_max": meta["lat_max"],
+            "lon_min": meta["lon_min"],
+            "lon_max": meta["lon_max"],
+            "sensor": meta["sensor"],
+        })
+    with open(csv_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
     if top_results:
         safe_label = query_label.replace(" ", "_").replace("/", "-")[:40]
         out_png = os.path.join(RESULTS_DIR, f"search_{safe_label}.png")
         save_results_preview(top_results, query_label, out_png)
-
-        # Clean single search_results.csv
-        csv_file = os.path.join(RESULTS_DIR, "search_results.csv")
-        csv_fieldnames = ["rank", "query", "score", "tile_file", "acquisition_date",
-                          "lat_min", "lat_max", "lon_min", "lon_max", "sensor"]
-        rows = []
-        for rank, (score, meta) in enumerate(top_results, 1):
-            rows.append({
-                "rank": rank,
-                "query": query_label,
-                "score": round(score, 4),
-                "tile_file": meta["tile_file"],
-                "acquisition_date": meta["acquisition_date"],
-                "lat_min": meta["lat_min"],
-                "lat_max": meta["lat_max"],
-                "lon_min": meta["lon_min"],
-                "lon_max": meta["lon_max"],
-                "sensor": meta["sensor"],
-            })
-        with open(csv_file, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=csv_fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-        print(f"Results saved -> {csv_file}")
+    print(f"Results saved -> {csv_file}")
 
 
 if __name__ == "__main__":

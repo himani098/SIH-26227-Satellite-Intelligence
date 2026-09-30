@@ -84,14 +84,43 @@ def calibrate(candidates, nodata_lookup):
 
         s_penalty = seasonal_penalty(c["before_date"], c["after_date"])
         q_factor = quality_factor(nodata_before, nodata_after)
+        evidence = c.get("false_alarm_evidence", {})
+        shadow_fraction = float(evidence.get("shadow_fraction", 0.0))
+        shadow_penalty = min(0.25, shadow_fraction * 1.5) if shadow_fraction >= 0.10 else 0.0
+        vegetation_delta = abs(float(evidence.get("vegetation_index_delta", 0.0)))
+        vegetation_penalty = (
+            0.15 if vegetation_delta >= 0.20
+            and c.get("change_type") in ("general_change", "water_extent") else 0.0
+        )
+        timeline = c.get("temporal_timeline", [])
+        after_date = c.get("after_date")
+        temporary_water = (
+            c.get("change_type") == "water_extent"
+            and any(item.get("status") == "change_not_detected"
+                    and item.get("date", "") > after_date for item in timeline)
+        )
+        temporary_water_penalty = 0.40 if temporary_water else 0.0
 
-        adjusted_confidence = round(float(c["confidence"]) * q_factor * (1 - s_penalty), 3)
+        adjusted_confidence = round(
+            float(c["confidence"]) * q_factor * (1 - s_penalty)
+            * (1 - shadow_penalty) * (1 - vegetation_penalty)
+            * (1 - temporary_water_penalty), 3
+        )
 
         reasons = []
         if s_penalty > 0:
-            reasons.append(f"seasonal_mismatch ({get_season(c['before_date'])} vs {get_season(c['after_date'])})")
+            reasons.append(
+                f"seasonal_variation_risk ({get_season(c['before_date'])} vs {get_season(c['after_date'])})"
+            )
         if q_factor < 0.9:
             reasons.append(f"low_image_quality (nodata up to {max(nodata_before, nodata_after):.0%})")
+            reasons.append("cloud_or_nodata_mask_contamination")
+        if shadow_penalty > 0:
+            reasons.append(f"possible_shadow_variation ({shadow_fraction:.0%} darkened pixels)")
+        if vegetation_penalty > 0:
+            reasons.append(f"vegetation_or_seasonal_variation (absolute NDVI delta {vegetation_delta:.2f})")
+        if temporary_water:
+            reasons.append("temporary_water_candidate (later observation returned toward baseline)")
         if not reasons:
             reasons.append("no_confounders_detected")
 
@@ -101,6 +130,9 @@ def calibrate(candidates, nodata_lookup):
             "nodata_after": nodata_after,
             "seasonal_penalty": s_penalty,
             "quality_factor": round(q_factor, 3),
+            "shadow_penalty": round(shadow_penalty, 3),
+            "vegetation_penalty": round(vegetation_penalty, 3),
+            "temporary_water_penalty": round(temporary_water_penalty, 3),
             "adjusted_confidence": adjusted_confidence,
             "suppression_reasons": reasons,
         })
@@ -137,6 +169,7 @@ def main():
     if review_queue:
         keys = ["row", "col", "before_date", "after_date", "change_type",
                 "adjusted_confidence", "confidence", "seasonal_penalty", "quality_factor",
+            "shadow_penalty", "vegetation_penalty", "temporary_water_penalty",
                 "num_objects_marked", "earliest_observation", "preview_file",
                 "lat_min", "lon_min", "sensor", "suppression_reasons"]
         csv_rows = []

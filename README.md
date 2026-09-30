@@ -26,11 +26,13 @@ Download → Tile → Embed → Search → Detect Changes → Filter → Cluster
 | Feature | Implementation |
 |---|---|
 | 🔍 Semantic text search | OpenCLIP ViT-B/32 + FAISS vector index |
+| 🧭 Constraint-aware queries | Offline object, date, Ranchi/coordinate, and water-proximity parsing |
 | 🖼️ Image-to-image search | CLIP visual encoder + cosine similarity |
-| 🛰️ Change detection | Same-season embedding distance + spectral delta |
-| 🚫 False alarm suppression | Seasonal penalty + quality masking |
+| 🛰️ Change detection | Same-season embedding distance + measured spectral-change regions |
+| 🕒 Multi-temporal evidence | First appearance and baseline-relative persistence timeline |
+| 🚫 False alarm suppression | Explainable cloud/no-data, shadow, vegetation/season, and temporary-water reasons |
 | 🌐 Unsupervised discovery | KMeans 8-cluster terrain grouping |
-| 📋 Analyst dashboard | Streamlit 4-tab interactive UI |
+| 📋 Analyst dashboard | Streamlit review UI with offline event map and before/after evidence |
 | 📑 Audit trail | JSON + CSV decision logs, full provenance |
 | ⚡ Query latency | **88ms mean** (sub-100ms SLA met) |
 
@@ -138,6 +140,7 @@ python CODE\build_embeddings_index.py
 
 # Phase 4 — Semantic search
 python CODE\semantic_search.py --query "road development area" --top 5
+python CODE\semantic_search.py --query "new construction within 500m of a river in Ranchi from 2021 to 2024" --top 5
 
 # Phase 5 — Change detection
 python CODE\change_detection.py
@@ -161,6 +164,11 @@ streamlit run CODE\analyst_dashboard.py
 
 ### Change Detection (3-Panel Evidence)
 > BEFORE | AFTER (red bounding boxes on changed objects) | CHANGE HEATMAP
+
+Each connected changed region includes pixel area, estimated square-meter area,
+centroid, local confidence, and distance to spectrally detected water where present.
+The review queue includes later observations compared with the pre-change baseline;
+these image-derived measurements are evidence for analyst review, not ground truth.
 
 See `Dataset/change_previews/` and `PPT_Material/01_Change_Detection_Outputs/`
 
